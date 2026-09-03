@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lifecycle manager for inactive Amazon WorkSpaces.
+
+Parameters:
+  LambdaCodeS3Bucket:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+    Description: S3 bucket containing the Lambda deployment ZIP. The bucket must be in the stack region.
+  LambdaCodeS3Key:
+    Type: String
+    MinLength: 1
+    Description: S3 object key for the Lambda deployment ZIP.
+  ExistingSnsTopicArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:sns:[a-z]{2,8}(?:-[a-z0-9]+)+-[0-9]+:[0-9]{12}:[A-Za-z0-9_-]{1,256}$'
+    ConstraintDescription: Must be empty or a complete standard Amazon SNS topic ARN; FIFO topics are not supported.
+    Description: Optional ARN of an existing SNS topic for lifecycle notifications. Must be in the stack region (it is also used as a CloudWatch alarm action). Leave empty to create one.
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Optional email address subscribed to the lifecycle SNS topic.
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 8 * * ? *)
+    Description: EventBridge schedule for the lifecycle scan.
+  TargetRegions:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^\s*[a-z]{2,8}(?:-[a-z0-9]+)+-[0-9]+(?:\s*,\s*[a-z]{2,8}(?:-[a-z0-9]+)+-[0-9]+)*\s*$'
+    ConstraintDescription: Must be empty or a comma-separated list of AWS region names.
+    Description: Optional comma-separated list of AWS regions to scan. Leave empty to scan only the stack region.
+  WarningThresholdDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: Days since the last known user connection before a WorkSpace is warned.
+  TerminationThresholdDays:
+    Type: Number
+    Default: 60
+    MinValue: 1
+    Description: Days since the last known user connection before a WorkSpace is a termination candidate.
+  AutoTerminate:
+    Type: String
+    Default: false
+    AllowedValues:
+      - true
+      - false
+    Description: When true, the Lambda terminates eligible WorkSpaces after notifying SNS.
+  MaxTerminationPercent:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 100
+    Description: Circuit breaker used only when AutoTerminate=true. Maximum percentage of successfully assessed, lifecycle-eligible WorkSpaces that may be termination candidates before automatic termination is halted. Only applied when at least 10 WorkSpaces were successfully assessed.
+  MaxUnknownPercent:
+    Type: Number
+    Default: 10
+    MinValue: 0
+    MaxValue: 100
+    Description: Circuit breaker used only when AutoTerminate=true. Maximum percentage of lifecycle-eligible WorkSpaces that may have unknown evaluation results before automatic termination is halted.
+
+Conditions:
+  UseExistingSnsTopic: !Not [!Equals [!Ref ExistingSnsTopicArn, '']]
+  CreateSnsTopic: !Equals [!Ref ExistingSnsTopicArn, '']
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  HasTargetRegions: !Not [!Equals [!Ref TargetRegions, '']]
+  AutoTerminateEnabled: !Equals [!Ref AutoTerminate, 'true']
+
+Resources:
+  LifecycleNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSnsTopic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-notifications'
+      # Deliberately unencrypted: CloudWatch alarms cannot publish to a topic
+      # encrypted with the AWS managed key alias/aws/sns, which silently drops
+      # the error-alarm notifications. If encryption at rest is required, use a
+      # customer-managed KMS key instead (see README).
+
+  LifecycleNotificationsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !If
+        - UseExistingSnsTopic
+        - !Ref ExistingSnsTopicArn
+        - !Ref LifecycleNotificationsTopic
+
+  WorkSpacesLifecycleFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: WorkSpacesLifecycleAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - workspaces:DescribeWorkspaces
+                  - workspaces:DescribeWorkspacesConnectionStatus
+                  - workspaces:DescribeTags
+                Resource: '*'
+              - !If
+                - AutoTerminateEnabled
+                - Effect: Allow
+                  Action:
+                    - workspaces:TerminateWorkspaces
+                  Resource: !Sub 'arn:${AWS::Partition}:workspaces:*:${AWS::AccountId}:workspace/*'
+                - !Ref AWS::NoValue
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeNetworkInterfaces
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If
+                  - UseExistingSnsTopic
+                  - !Ref ExistingSnsTopicArn
+                  - !Ref LifecycleNotificationsTopic
+
+  WorkSpacesLifecycleFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Handler: app.lambda_handler
+      Runtime: python3.12
+      Role: !GetAtt WorkSpacesLifecycleFunctionRole.Arn
+      Timeout: 900
+      MemorySize: 256
+      Description: Detects inactive WorkSpaces using connection status and ENI age checks and applies lifecycle actions.
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !If
+            - UseExistingSnsTopic
+            - !Ref ExistingSnsTopicArn
+            - !Ref LifecycleNotificationsTopic
+          WARN_AFTER_DAYS: !Ref WarningThresholdDays
+          TERMINATE_AFTER_DAYS: !Ref TerminationThresholdDays
+          AUTO_TERMINATE: !Ref AutoTerminate
+          MAX_TERMINATION_PERCENT: !Ref MaxTerminationPercent
+          MAX_UNKNOWN_PERCENT: !Ref MaxUnknownPercent
+          TARGET_REGIONS: !If
+            - HasTargetRegions
+            - !Ref TargetRegions
+            - !Ref AWS::Region
+
+  WorkSpacesLifecycleSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-workspaces-lifecycle'
+      Description: Scheduled scan for inactive WorkSpaces.
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt WorkSpacesLifecycleFunction.Arn
+          Id: WorkSpacesLifecycleFunction
+
+  WorkSpacesLifecycleSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WorkSpacesLifecycleFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WorkSpacesLifecycleSchedule.Arn
+
+  WorkSpacesLifecycleConfigurationValidation:
+    Type: Custom::WorkSpacesLifecycleConfigValidation
+    Properties:
+      ServiceToken: !GetAtt WorkSpacesLifecycleFunction.Arn
+      WarningThresholdDays: !Ref WarningThresholdDays
+      TerminationThresholdDays: !Ref TerminationThresholdDays
+      ExistingSnsTopicArn: !Ref ExistingSnsTopicArn
+      TargetRegions: !If
+        - HasTargetRegions
+        - !Ref TargetRegions
+        - !Ref AWS::Region
+      StackRegion: !Ref AWS::Region
+      StackPartition: !Ref AWS::Partition
+
+  WorkSpacesLifecycleErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-lambda-errors'
+      AlarmDescription: >-
+        The WorkSpaces lifecycle Lambda failed. Scheduled lifecycle scans may be
+        silently stopped until the error is investigated and resolved.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WorkSpacesLifecycleFunction
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If
+          - UseExistingSnsTopic
+          - !Ref ExistingSnsTopicArn
+          - !Ref LifecycleNotificationsTopic
+
+Outputs:
+  WorkSpacesLifecycleFunctionName:
+    Description: Name of the lifecycle Lambda function.
+    Value: !Ref WorkSpacesLifecycleFunction
+  WorkSpacesLifecycleFunctionArn:
+    Description: ARN of the lifecycle Lambda function.
+    Value: !GetAtt WorkSpacesLifecycleFunction.Arn
+  LifecycleNotificationsTopicArn:
+    Description: ARN of the SNS topic used for lifecycle notifications.
+    Value: !If
+      - UseExistingSnsTopic
+      - !Ref ExistingSnsTopicArn
+      - !Ref LifecycleNotificationsTopic
