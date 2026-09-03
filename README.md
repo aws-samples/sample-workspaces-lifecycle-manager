@@ -1,11 +1,7 @@
-## My Project
+## Automate Cleanup of Inactive Amazon WorkSpaces
 
-TODO: Fill this README out!
-
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
+CloudFormation template to deploy a serverless lifecycle management solution to proactively identify and optionally terminate unused Amazon WorkSpaces Personal desktops.
+For details refer to Builder Center article:
 
 ## Security
 
